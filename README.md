@@ -14,7 +14,11 @@ LoRA writes the weight update as `ΔW = BA`. Under high data heterogeneity (Diri
 pip install -r requirements.txt
 ```
 
-Tested on Python 3.10, CUDA 12.x, RTX 3090 (24 GB).
+`requirements.txt` pins the environment of the most recent runs (Python 3.13, RTX 3090 with 24 GB). Those runs used the CUDA 12.6 builds of torch and torchvision; to install them:
+
+```bash
+pip install --extra-index-url https://download.pytorch.org/whl/cu126 -r requirements.txt
+```
 
 ## Run
 
@@ -37,6 +41,8 @@ python run.py --config configs/paper/s82/mnli/mnli_fedit_saf09_a005_s42.yaml --g
 | EMA-Eval      | `0.9` | `none`   |
 | EMA-B         | `0.9` | `b_only` |
 | **SAF** (ours) | `0.9` | `a_only` |
+
+Two further options serve as controls. `training.ema_feedback: ab_only` feeds back `A` and `B` but not the classifier head. `evaluation.hybrid_endpoints: true` also evaluates, at every evaluation round, models that take only some tensors from the EMA and the rest from the training path (`hyb_a`: `A`; `hyb_ab`: `A` and `B`; `hyb_a_head`: `A` and the head); they are logged as extra test splits and do not change the training trajectory.
 
 ## Outputs
 
