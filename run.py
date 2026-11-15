@@ -523,12 +523,19 @@ def run_personalized_eval(model, fl_method, client_test_loaders, evaluator, devi
     if not eval_clients:
         return {}
     global_state = model.state_dict()
+    # state_dict() tensors alias the live parameters, so loading a client's
+    # params in-place would mutate global_state too and the final restore
+    # would be a no-op. Clone every key we overwrite so the restore is real.
+    overwritten = {}
     client_metrics = []
     model.eval()
     for client_id in eval_clients:
         client_state = fl_method.get_client_state(client_id)
         if client_state is None:
             continue
+        for name in client_state:
+            if name in global_state and name not in overwritten:
+                overwritten[name] = global_state[name].detach().clone()
         personalized_state = {**global_state}
         for (name, param) in client_state.items():
             if name in personalized_state:
@@ -537,7 +544,8 @@ def run_personalized_eval(model, fl_method, client_test_loaders, evaluator, devi
         metrics = evaluator.evaluate(model, client_test_loaders[client_id])
         acc = get_primary_metric(metrics, dataset_name)
         client_metrics.append(acc)
-    model.load_state_dict(global_state, strict=False)
+    if overwritten:
+        model.load_state_dict(overwritten, strict=False)
     if not client_metrics:
         return {}
     avg_acc = sum(client_metrics) / len(client_metrics)

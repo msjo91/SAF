@@ -13,9 +13,19 @@ class FedSALoRA(FedIT):
         params = get_method_params(config)
         self.aggregation_mode = params.get('aggregation_mode', 'sa')
         self._client_local_params = {}
-        logger.info(f'FedSA-LoRA initialized: aggregation_mode={self.aggregation_mode}, aggregate lora_A + classifier only, lora_B kept client-local')
+        self._b_restore_logged = False
+        logger.info(f'FedSA-LoRA initialized: aggregation_mode={self.aggregation_mode}, aggregate lora_A + classifier only, lora_B kept client-local and persistent across rounds')
 
     def local_train(self, model, train_loader, client_id, **kwargs):
+        stored_b = self._client_local_params.get(client_id)
+        if stored_b:
+            # The trainer hands us a fresh copy of the global model, whose lora_B is
+            # never aggregated (stays at init). FedSA-LoRA keeps B client-local, so a
+            # returning client must resume from its own B, not relearn from init.
+            model.load_state_dict(stored_b, strict=False)
+            if not self._b_restore_logged:
+                logger.info(f'FedSA-LoRA: restored {len(stored_b)} client-local lora_B params for returning client {client_id} (B persistence active)')
+                self._b_restore_logged = True
         update = super().local_train(model, train_loader, client_id, **kwargs)
         local_b = {}
         for (name, param) in update.state_dict.items():
