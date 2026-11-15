@@ -149,6 +149,8 @@ def _detect_ema_mode(config):
         return 'saf09'
     elif ema_feedback == 'b_only':
         return 'ema_b09'
+    elif ema_feedback == 'ab_only':
+        return 'ema_ab09'
     elif ema_feedback == 'full':
         return 'ema_full09'
     elif ema_feedback in (None, 'skip'):
@@ -156,6 +158,20 @@ def _detect_ema_mode(config):
     else:
         return 'ema_eval09'
 _detect_lr_category = _detect_ema_mode
+
+# Deployment endpoints that mix EMA tensors with training-path tensors. They are
+# evaluated only when evaluation.hybrid_endpoints is true, and logged as extra test
+# splits next to 'val' (training-path model) and 'ema' (EMA of every key).
+# Each predicate says whether a state-dict key is taken from the EMA. 'head' means
+# every key that is not a LoRA factor; with a frozen backbone that is the classifier.
+HYBRID_ENDPOINTS = {
+    'hyb_a': lambda k: 'lora_A' in k,                    # EMA A; raw B and head
+    'hyb_ab': lambda k: 'lora_A' in k or 'lora_B' in k,  # EMA A and B; raw head
+    'hyb_a_head': lambda k: 'lora_B' not in k,           # EMA A and head; raw B
+}
+
+def _mix_state(path_state, ema_state, use_ema):
+    return {k: ema_state[k] if k in ema_state and use_ema(k) else v for (k, v) in path_state.items()}
 
 def setup_output_directory(args, config):
     if args.output:
@@ -806,6 +822,9 @@ def train_federated(config, method_name, model, train_dataset, client_indices, v
             elif ema_feedback_gamma_b_ratio > 0:
                 logger.info(f'  SABF B-feedback enabled: gamma_b_ratio={ema_feedback_gamma_b_ratio} (gamma_b = gamma_a * ratio)')
         ema_state = {k: v.clone().cpu() for (k, v) in model.state_dict().items()}
+    hybrid_endpoints = bool(config.get('evaluation', {}).get('hybrid_endpoints', False)) and ema_state is not None
+    if hybrid_endpoints:
+        logger.info(f'Hybrid endpoints enabled: {list(HYBRID_ENDPOINTS)} evaluated at every evaluation round')
     logger.info(f'Starting federated training for {global_rounds} rounds')
     if hasattr(fl_method, 'get_method_info'):
         method_info = fl_method.get_method_info()
@@ -974,6 +993,29 @@ def train_federated(config, method_name, model, train_dataset, client_indices, v
                     ema_best_metric = ema_metric
                     ema_best_round = display_round
                     logger.info(f'New EMA best at round {display_round} with metric={ema_metric:.4f}')
+                if hybrid_endpoints:
+                    # Every DataLoader iterator draws a seed from the global generator, so the
+                    # extra evaluations would shift the shuffling of all later rounds. Restore
+                    # the generators afterwards: a run with hybrid endpoints then follows the
+                    # same trajectory as the same run without them.
+                    cpu_rng_state = torch.get_rng_state()
+                    cuda_rng_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+                    for (hyb_name, use_ema) in HYBRID_ENDPOINTS.items():
+                        model.load_state_dict(_mix_state(original_state, ema_state, use_ema), strict=False)
+                        if dataset_name == 'mnli' and isinstance(val_loader, dict):
+                            hyb_matched = evaluator.evaluate(model, val_loader['matched'], split='matched')
+                            hyb_mismatched = evaluator.evaluate(model, val_loader['mismatched'], split='mismatched')
+                            hyb_m_acc = hyb_matched.get('accuracy', 0)
+                            hyb_mm_acc = hyb_mismatched.get('accuracy', 0)
+                            hyb_avg_loss = (hyb_matched.get('loss', 0) + hyb_mismatched.get('loss', 0)) / 2
+                            hyb_metrics = {'matched_acc': hyb_m_acc, 'mismatched_acc': hyb_mm_acc, 'accuracy': (hyb_m_acc + hyb_mm_acc) / 2, 'loss': hyb_avg_loss}
+                        else:
+                            hyb_metrics = evaluator.evaluate(model, val_loader)
+                        tracker.log_test_metrics(round_idx, {'split': hyb_name, **hyb_metrics})
+                        logger.info(f'Round {display_round} | {hyb_name}: {hyb_metrics}')
+                    torch.set_rng_state(cpu_rng_state)
+                    if cuda_rng_state is not None:
+                        torch.cuda.set_rng_state_all(cuda_rng_state)
                 model.load_state_dict(original_state, strict=False)
         if ema_state is not None and ema_feedback_mode is not None:
             with torch.no_grad():
@@ -1255,7 +1297,7 @@ def train_federated(config, method_name, model, train_dataset, client_indices, v
                     for k in state:
                         if k not in ema_state:
                             continue
-                        feed = ema_feedback_mode == 'full' or (ema_feedback_mode == 'a_only' and 'lora_A' in k) or (ema_feedback_mode == 'b_only' and 'lora_B' in k)
+                        feed = ema_feedback_mode == 'full' or (ema_feedback_mode == 'a_only' and 'lora_A' in k) or (ema_feedback_mode == 'b_only' and 'lora_B' in k) or (ema_feedback_mode == 'ab_only' and ('lora_A' in k or 'lora_B' in k))
                         if feed:
                             state[k] = ema_state[k].clone().to(state[k].device)
                             n_fed += 1

@@ -81,6 +81,7 @@ class EvaluationConfig:
     metrics: Any = field(default_factory=list)
     test_batch_size: Any = 64
     personalized_eval: Any = False
+    hybrid_endpoints: Any = False
 
 @dataclass
 class Config:
